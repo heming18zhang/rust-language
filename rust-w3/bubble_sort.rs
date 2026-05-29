@@ -9,7 +9,7 @@ fn main() {
 
     // Bubble sort with swap counting
   	
- 		let len = numbers.len() - 1;
+ 	let len = numbers.len() - 1;
   	let mut swaps = 0;
   	for i in 0..len {
     	for j in 0..len-i-1 {
