@@ -10,6 +10,66 @@ use ferrisetw::EventRecord;
 
 use tracelogging_dynamic as tld;
 
+// ============================================================================
+// winevent
+//
+// A small ETW command line toolbox for Windows.
+//
+// Main goals:
+//   1. List OS registered ETW providers.
+//   2. Find ETW providers by keyword.
+//   3. Show active ETW sessions.
+//   4. Monitor ETW providers in real time.
+//   5. Generate dynamic TraceLogging ETW events for testing.
+//   6. Start / stop / delete simple logman trace sessions.
+//   7. Decode ETL files with tracerpt.
+//
+// Cargo.toml:
+//
+//   [package]
+//   name = "winevent"
+//   version = "0.1.0"
+//   edition = "2021"
+//
+//   [dependencies]
+//   ferrisetw = "1.2"
+//   tracelogging_dynamic = "1.2"
+//
+// Build:
+//
+//   cargo build
+//   cargo build --release
+//
+// Examples:
+//
+//   .\target\debug\winevent.exe help
+//   .\target\debug\winevent.exe list
+//   .\target\debug\winevent.exe find bluetooth
+//   .\target\debug\winevent.exe sessions
+//   .\target\debug\winevent.exe provider Microsoft-Windows-Kernel-Process
+//   .\target\debug\winevent.exe guid Demo.Bluetooth.Test
+//   .\target\debug\winevent.exe monitor Demo.Bluetooth.Test
+//   .\target\debug\winevent.exe generate Demo.Bluetooth.Test ConnectEvent "Seq=u32:1"
+//   .\target\debug\winevent.exe record bt Microsoft-Windows-Bluetooth-BTHPORT bt.etl
+//   .\target\debug\winevent.exe stop bt
+//   .\target\debug\winevent.exe decode bt.etl bt.csv csv
+// ============================================================================
+
+// ============================================================================
+// DynamicField
+//
+// This enum represents a runtime-defined ETW field.
+//
+// The "generate" subcommand accepts fields like:
+//
+//   Name=string:value
+//   Name=u32:123
+//   Name=i64:-55
+//   Name=bool:true
+//
+// We parse those strings into this enum, then write them through
+// tracelogging_dynamic::EventBuilder.
+// ============================================================================
 #[derive(Debug, Clone)]
 enum DynamicField {
     Str(String, String),
@@ -18,28 +78,71 @@ enum DynamicField {
     Bool(String, bool),
 }
 
+// ============================================================================
+// print_usage
+//
+// Prints the command line help.
+//
+// Important:
+//   Use eprintln!("{}", raw_string)
+//   instead of eprintln!(raw_string)
+//
+// Reason:
+//   The help text contains "{GUID}" examples.
+//   Rust format strings treat "{}" as placeholders.
+//   Passing the raw string as an argument avoids format-string parsing issues.
+// ============================================================================
 fn print_usage() {
     eprintln!(
         "{}",
         r#"Usage:
   winevent.exe help
   winevent.exe logman-help
+
   winevent.exe list
   winevent.exe find <keyword>
   winevent.exe sessions
-  winevent.exe monitor <provider1> [provider2] ...
-  winevent.exe generate <provider_name> <event_name> [--count N] [--interval-ms N] [fields...]
+  winevent.exe provider <provider-name-or-guid>
+  winevent.exe guid <provider-name>
+
+  winevent.exe monitor <provider-name-or-guid> [provider-name-or-guid] ...
+
+  winevent.exe generate <provider-name> <event-name> [--count N] [--interval-ms N] [fields...]
+
+  winevent.exe record <session-name> <provider-name-or-guid> <etl-file> [flags] [level]
+  winevent.exe stop <session-name>
+  winevent.exe delete <session-name>
+  winevent.exe decode <etl-file> <out-file> [csv]
 
 Examples:
+  winevent.exe help
+  winevent.exe logman-help
+
   winevent.exe list
   winevent.exe find bluetooth
   winevent.exe sessions
-  winevent.exe monitor "Demo.Bluetooth.Test"
-  winevent.exe monitor "{22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}"
-  winevent.exe generate "Demo.Bluetooth.Test" "ConnectEvent" "Seq=u32:1" "Status=bool:true" "Device=string:FakeBT"
-  winevent.exe generate "Demo.Bluetooth.Test" "ConnectEvent" --count 5 --interval-ms 500 "Seq=u32:1" "Status=bool:true" "Device=string:FakeBT"
 
-Field format:
+  winevent.exe provider Microsoft-Windows-Kernel-Process
+  winevent.exe provider "{22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}"
+
+  winevent.exe guid Demo.Bluetooth.Test
+
+  winevent.exe monitor Demo.Bluetooth.Test
+  winevent.exe monitor "{22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}"
+
+  winevent.exe generate Demo.Bluetooth.Test ConnectEvent "Seq=u32:1" "Status=bool:true" "Device=string:FakeBT"
+  winevent.exe generate Demo.Bluetooth.Test ConnectEvent --count 5 --interval-ms 500 "Seq=u32:1"
+
+  winevent.exe record bt Microsoft-Windows-Bluetooth-BTHPORT bt.etl
+  winevent.exe record bt Microsoft-Windows-Bluetooth-BTHPORT bt.etl 0xFFFFFFFF 5
+
+  winevent.exe stop bt
+  winevent.exe delete bt
+
+  winevent.exe decode bt.etl bt.xml
+  winevent.exe decode bt.etl bt.csv csv
+
+Field format for generate:
   Name=string:value
   Name=u32:value
   Name=i64:value
@@ -48,31 +151,112 @@ Field format:
     );
 }
 
+// ============================================================================
+// run_help
+//
+// Shows extended help text.
+// ============================================================================
 fn run_help() {
     print_usage();
+
     println!(
         "{}",
-        r#"Extra subcommands:
+        r#"
+Subcommand summary:
+
+  help
+      Show winevent help.
+
   logman-help
-      Run: logman /?
+      Run native Windows command:
+        logman /?
 
   list
-      Run: logman query providers
+      Run:
+        logman query providers
+      This lists OS registered ETW providers and GUIDs.
 
   find <keyword>
-      Run: logman query providers, then filter output by keyword
+      Run:
+        logman query providers
+      Then filter provider lines by keyword.
+      This is convenient for searching providers like bluetooth, kernel, tcpip.
 
   sessions
-      Run: logman query -ets
+      Run:
+        logman query -ets
+      This shows currently active Event Trace Sessions.
+
+  provider <provider-name-or-guid>
+      Run:
+        logman query providers <provider>
+      This shows details for one provider when logman can resolve it.
+
+  guid <provider-name>
+      Compute TraceLogging name-hash GUID for a dynamic provider name.
+      This is useful for dynamic providers such as Demo.Bluetooth.Test.
+
+  monitor <provider-name-or-guid> [...]
+      Start a realtime ETW consumer using ferrisetw.
+      You can pass one or multiple providers.
+      For dynamic TraceLogging providers, if lookup by name fails, winevent
+      falls back to the TraceLogging name-hash GUID.
+
+  generate <provider-name> <event-name> [...]
+      Generate dynamic TraceLogging events.
+      This is useful for testing whether your service can capture ETW events.
+
+  record <session> <provider> <etl-file> [flags] [level]
+      Start a simple logman ETW trace session.
+      Default flags: 0xFFFFFFFF
+      Default level: 5
+
+  stop <session>
+      Stop a logman ETW trace session.
+
+  delete <session>
+      Delete a logman data collector/session.
+
+  decode <etl-file> <out-file> [csv]
+      Decode ETL with tracerpt.
+      If the third argument is "csv", output format is CSV.
 
 Recommended workflow:
-  winevent.exe find bluetooth
-  winevent.exe monitor "{GUID}"
-  winevent.exe generate Demo.Bluetooth.Test ConnectEvent "Seq=u32:1"
+  1. Find provider:
+       winevent.exe find bluetooth
+
+  2. Inspect provider:
+       winevent.exe provider <provider-name-or-guid>
+
+  3. Monitor provider:
+       winevent.exe monitor <provider-name-or-guid>
+
+  4. Generate a test event:
+       winevent.exe generate Demo.Bluetooth.Test ConnectEvent "Seq=u32:1"
+
+  5. Record to ETL:
+       winevent.exe record bt <provider-name-or-guid> bt.etl
+
+  6. Stop recording:
+       winevent.exe stop bt
+
+  7. Decode ETL:
+       winevent.exe decode bt.etl bt.csv csv
 "#
     );
 }
 
+// ============================================================================
+// run_external_command
+//
+// Helper for calling external Windows tools such as:
+//
+//   logman
+//   tracerpt
+//
+// It prints stdout and stderr directly.
+// This keeps the wrapper simple and transparent.
+// ============================================================================
 fn run_external_command(program: &str, args: &[&str]) {
     let output = Command::new(program)
         .args(args)
@@ -97,19 +281,62 @@ fn run_external_command(program: &str, args: &[&str]) {
     }
 }
 
+// ============================================================================
+// Basic logman wrapper subcommands
+// ============================================================================
+
 fn run_logman_help() {
+    // Equivalent to:
+    //   logman /?
     run_external_command("logman", &["/?"]);
 }
 
 fn run_list() {
+    // Equivalent to:
+    //   logman query providers
+    //
+    // Shows all OS registered ETW providers and GUIDs.
     run_external_command("logman", &["query", "providers"]);
 }
 
 fn run_sessions() {
+    // Equivalent to:
+    //   logman query -ets
+    //
+    // Shows currently active Event Trace Sessions.
     run_external_command("logman", &["query", "-ets"]);
 }
 
+fn run_provider(args: &[String]) {
+    // Query details for a specific provider.
+    //
+    // Equivalent to:
+    //   logman query providers <provider>
+    //
+    // Example:
+    //   winevent.exe provider Microsoft-Windows-Kernel-Process
+    //   winevent.exe provider "{22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}"
+
+    if args.is_empty() {
+        eprintln!("provider requires a provider name or GUID");
+        print_usage();
+        std::process::exit(1);
+    }
+
+    run_external_command("logman", &["query", "providers", args[0].as_str()]);
+}
+
 fn run_find(args: &[String]) {
+    // Search providers by keyword.
+    //
+    // This runs:
+    //   logman query providers
+    //
+    // Then filters lines in Rust.
+    //
+    // Example:
+    //   winevent.exe find bluetooth
+
     if args.is_empty() {
         eprintln!("find requires a keyword");
         print_usage();
@@ -143,7 +370,19 @@ fn run_find(args: &[String]) {
     }
 }
 
+// ============================================================================
+// GUID helpers
+//
+// TraceLogging dynamic providers use a stable GUID generated from provider name.
+// This is important because dynamic providers may not be discoverable by name
+// through Provider::by_name before the generator process registers them.
+// ============================================================================
+
 fn looks_like_guid(s: &str) -> bool {
+    // Accept both:
+    //   22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716
+    //   {22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}
+
     let trimmed = s.trim_matches(|c| c == '{' || c == '}');
 
     if trimmed.len() != 36 {
@@ -164,6 +403,17 @@ fn looks_like_guid(s: &str) -> bool {
 }
 
 fn guid_to_string_from_raw_bytes(raw: &[u8; 16]) -> String {
+    // tld::Guid uses Windows in-memory layout:
+    //
+    //   data1: u32 little-endian
+    //   data2: u16 little-endian
+    //   data3: u16 little-endian
+    //   data4: [u8; 8]
+    //
+    // Standard GUID string format:
+    //
+    //   {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}
+
     let data1 = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
     let data2 = u16::from_le_bytes([raw[4], raw[5]]);
     let data3 = u16::from_le_bytes([raw[6], raw[7]]);
@@ -185,12 +435,52 @@ fn guid_to_string_from_raw_bytes(raw: &[u8; 16]) -> String {
 }
 
 fn provider_name_to_tracelogging_guid_string(provider_name: &str) -> String {
+    // Generate the stable TraceLogging GUID from a provider name.
+    //
+    // Example:
+    //   Demo.Bluetooth.Test -> {some-stable-guid}
+    //
+    // This is useful when monitoring dynamic providers.
+
     let guid = tld::Guid::from_name(provider_name);
     let raw = guid.as_bytes_raw();
     guid_to_string_from_raw_bytes(raw)
 }
 
+fn run_guid(args: &[String]) {
+    // Print TraceLogging name-hash GUID for one or more provider names.
+    //
+    // Example:
+    //   winevent.exe guid Demo.Bluetooth.Test
+
+    if args.is_empty() {
+        eprintln!("guid requires at least one provider name");
+        print_usage();
+        std::process::exit(1);
+    }
+
+    for provider_name in args {
+        let guid = provider_name_to_tracelogging_guid_string(provider_name);
+        println!("{} {}", provider_name, guid);
+    }
+}
+
+// ============================================================================
+// Field parser for "generate"
+// ============================================================================
+
 fn parse_field_arg(s: &str) -> Result<DynamicField, String> {
+    // Expected format:
+    //
+    //   Name=type:value
+    //
+    // Examples:
+    //
+    //   Seq=u32:1
+    //   Device=string:FakeBT
+    //   Rssi=i64:-55
+    //   Status=bool:true
+
     let (name, rhs) = s
         .split_once('=')
         .ok_or_else(|| format!("Invalid field '{}': missing '='", s))?;
@@ -206,6 +496,7 @@ fn parse_field_arg(s: &str) -> Result<DynamicField, String> {
             let parsed = value
                 .parse::<u32>()
                 .map_err(|e| format!("Invalid u32 in '{}': {}", s, e))?;
+
             Ok(DynamicField::U32(name.to_string(), parsed))
         }
 
@@ -213,6 +504,7 @@ fn parse_field_arg(s: &str) -> Result<DynamicField, String> {
             let parsed = value
                 .parse::<i64>()
                 .map_err(|e| format!("Invalid i64 in '{}': {}", s, e))?;
+
             Ok(DynamicField::I64(name.to_string(), parsed))
         }
 
@@ -220,6 +512,7 @@ fn parse_field_arg(s: &str) -> Result<DynamicField, String> {
             let parsed = value
                 .parse::<bool>()
                 .map_err(|e| format!("Invalid bool in '{}': {}", s, e))?;
+
             Ok(DynamicField::Bool(name.to_string(), parsed))
         }
 
@@ -230,7 +523,25 @@ fn parse_field_arg(s: &str) -> Result<DynamicField, String> {
     }
 }
 
+// ============================================================================
+// Realtime ETW monitor
+//
+// ferrisetw creates a realtime ETW trace session and invokes a callback
+// for each event.
+// ============================================================================
+
 fn on_event(record: &EventRecord, schema_locator: &SchemaLocator) {
+    // This callback is intentionally generic.
+    //
+    // It does not assume any known event payload schema.
+    // That is important because "monitor" can target any provider.
+    //
+    // For now, print:
+    //   provider name
+    //   event id
+    //
+    // Later you can extend this to parse specific provider fields.
+
     match schema_locator.event_schema(record) {
         Ok(schema) => {
             println!(
@@ -251,6 +562,7 @@ fn on_event(record: &EventRecord, schema_locator: &SchemaLocator) {
 }
 
 fn build_provider(name_or_guid: &str) -> Provider {
+    // If input looks like a GUID, monitor directly by GUID.
     if looks_like_guid(name_or_guid) {
         println!("[info] monitor by GUID: {}", name_or_guid);
 
@@ -261,6 +573,13 @@ fn build_provider(name_or_guid: &str) -> Provider {
             .build();
     }
 
+    // First try provider lookup by name.
+    //
+    // This works for many OS-registered providers, for example:
+    //   Microsoft-Windows-Kernel-Process
+    //
+    // But it may fail for dynamic TraceLogging providers such as:
+    //   Demo.Bluetooth.Test
     match Provider::by_name(name_or_guid) {
         Ok(builder) => {
             println!("[info] monitor by provider name: {}", name_or_guid);
@@ -273,6 +592,8 @@ fn build_provider(name_or_guid: &str) -> Provider {
         }
 
         Err(err) => {
+            // Dynamic TraceLogging providers may not be discoverable by name.
+            // In that case, fallback to the TraceLogging provider-name GUID.
             let fallback_guid = provider_name_to_tracelogging_guid_string(name_or_guid);
 
             println!(
@@ -303,7 +624,7 @@ fn run_monitor(provider_args: &[String]) {
     println!("[info] starting realtime ETW monitor");
     println!("[info] providers = {:?}", provider_args);
 
-    let mut trace_builder = UserTrace::new().named("RustEtwMonitor".to_string());
+    let mut trace_builder = UserTrace::new().named("WineventRealtimeMonitor".to_string());
 
     for provider_arg in provider_args {
         let provider = build_provider(provider_arg);
@@ -321,16 +642,29 @@ fn run_monitor(provider_args: &[String]) {
     }
 }
 
+// ============================================================================
+// Dynamic ETW event generator
+//
+// Uses tracelogging_dynamic to generate TraceLogging events with runtime
+// provider name, event name, and fields.
+// ============================================================================
+
 fn write_one_event(provider: &tld::Provider, event_name: &str, fields: &[DynamicField]) {
     let level = tld::Level::Verbose;
     let keyword: u64 = 0x1;
 
+    // If no ETW session is listening for this provider/level/keyword,
+    // provider.enabled(...) returns false.
+    //
+    // In that case, we skip building the event to reduce overhead.
     if !provider.enabled(level, keyword) {
         println!("[send] nobody is listening for this level/keyword; event skipped");
         return;
     }
 
     let mut builder = tld::EventBuilder::new();
+
+    // Start a new dynamic TraceLogging event.
     builder.reset(event_name, level, keyword, 0);
 
     for field in fields {
@@ -348,12 +682,17 @@ fn write_one_event(provider: &tld::Provider, event_name: &str, fields: &[Dynamic
             }
 
             DynamicField::Bool(name, value) => {
+                // add_bool32 expects i32, not bool.
+                // ETW Bool32 convention:
+                //   0 = false
+                //   non-zero = true
                 let bool32_value: i32 = if *value { 1 } else { 0 };
                 builder.add_bool32(name, bool32_value, tld::OutType::Default, 0);
             }
         }
     }
 
+    // Send event to ETW.
     let status = builder.write(provider, None, None);
 
     if status != 0 {
@@ -423,6 +762,13 @@ fn run_generate(args: &[String]) {
         &tld::Provider::options(),
     ));
 
+    // Register the provider with ETW.
+    //
+    // Safety:
+    //   register() is unsafe because a registered provider must be properly
+    //   unregistered before unload.
+    //
+    // For this short-lived CLI process, the provider is dropped when the process exits.
     unsafe {
         provider.as_ref().register();
     }
@@ -448,6 +794,128 @@ fn run_generate(args: &[String]) {
 
     println!("[info] generate done");
 }
+
+// ============================================================================
+// logman record / stop / delete / tracerpt decode helpers
+// ============================================================================
+
+fn run_record(args: &[String]) {
+    // Start a simple ETW trace session using logman.
+    //
+    // Usage:
+    //   winevent.exe record <session-name> <provider> <etl-file> [flags] [level]
+    //
+    // Example:
+    //   winevent.exe record bt Microsoft-Windows-Bluetooth-BTHPORT bt.etl
+    //   winevent.exe record bt Microsoft-Windows-Bluetooth-BTHPORT bt.etl 0xFFFFFFFF 5
+    //
+    // Defaults:
+    //   flags = 0xFFFFFFFF
+    //   level = 5
+
+    if args.len() < 3 {
+        eprintln!("record requires: <session-name> <provider> <etl-file> [flags] [level]");
+        print_usage();
+        std::process::exit(1);
+    }
+
+    let session = &args[0];
+    let provider = &args[1];
+    let etl_file = &args[2];
+
+    let flags = if args.len() >= 4 {
+        args[3].as_str()
+    } else {
+        "0xFFFFFFFF"
+    };
+
+    let level = if args.len() >= 5 {
+        args[4].as_str()
+    } else {
+        "5"
+    };
+
+    run_external_command(
+        "logman",
+        &[
+            "create",
+            "trace",
+            session.as_str(),
+            "-p",
+            provider.as_str(),
+            flags,
+            level,
+            "-o",
+            etl_file.as_str(),
+            "-ets",
+        ],
+    );
+}
+
+fn run_stop(args: &[String]) {
+    // Stop an active ETW session.
+    //
+    // Equivalent to:
+    //   logman stop <session> -ets
+
+    if args.is_empty() {
+        eprintln!("stop requires a session name");
+        print_usage();
+        std::process::exit(1);
+    }
+
+    run_external_command("logman", &["stop", args[0].as_str(), "-ets"]);
+}
+
+fn run_delete(args: &[String]) {
+    // Delete a logman data collector/session.
+    //
+    // Equivalent to:
+    //   logman delete <session>
+
+    if args.is_empty() {
+        eprintln!("delete requires a session name");
+        print_usage();
+        std::process::exit(1);
+    }
+
+    run_external_command("logman", &["delete", args[0].as_str()]);
+}
+
+fn run_decode(args: &[String]) {
+    // Decode an ETL file with tracerpt.
+    //
+    // Usage:
+    //   winevent.exe decode <etl-file> <out-file> [csv]
+    //
+    // Examples:
+    //   winevent.exe decode bt.etl bt.xml
+    //   winevent.exe decode bt.etl bt.csv csv
+
+    if args.len() < 2 {
+        eprintln!("decode requires: <etl-file> <out-file> [csv]");
+        print_usage();
+        std::process::exit(1);
+    }
+
+    let etl_file = &args[0];
+    let out_file = &args[1];
+
+    if args.len() >= 3 && args[2].eq_ignore_ascii_case("csv") {
+        run_external_command(
+            "tracerpt",
+            &[etl_file.as_str(), "-o", out_file.as_str(), "-of", "CSV"],
+        );
+    } else {
+        run_external_command("tracerpt", &[etl_file.as_str(), "-o", out_file.as_str()]);
+    }
+}
+
+// ============================================================================
+// main
+//
+// Dispatch command line subcommands.
+// ============================================================================
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -478,12 +946,36 @@ fn main() {
             run_sessions();
         }
 
+        "provider" => {
+            run_provider(&args[2..]);
+        }
+
+        "guid" => {
+            run_guid(&args[2..]);
+        }
+
         "monitor" => {
             run_monitor(&args[2..]);
         }
 
         "generate" => {
             run_generate(&args[2..]);
+        }
+
+        "record" => {
+            run_record(&args[2..]);
+        }
+
+        "stop" => {
+            run_stop(&args[2..]);
+        }
+
+        "delete" => {
+            run_delete(&args[2..]);
+        }
+
+        "decode" => {
+            run_decode(&args[2..]);
         }
 
         _ => {
