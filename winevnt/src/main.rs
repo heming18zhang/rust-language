@@ -1,4 +1,5 @@
 use std::env;
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -14,6 +15,9 @@ use tracelogging_dynamic as tld;
 //
 // Subcommands:
 //
+//   list
+//     Run "logman query providers" and print all OS registered ETW providers.
+//
 //   monitor
 //     Monitor one or more ETW providers in real time.
 //
@@ -26,6 +30,8 @@ use tracelogging_dynamic as tld;
 //   cargo build --release
 //
 // Examples:
+//
+//   .\target\release\etw_send_and_monitor.exe list
 //
 //   .\target\release\etw_send_and_monitor.exe monitor "Demo.Bluetooth.Test"
 //
@@ -59,11 +65,15 @@ fn print_usage() {
     eprintln!(
         "{}",
         r#"Usage:
+  etw_send_and_monitor.exe list
+
   etw_send_and_monitor.exe monitor <provider1> [provider2] [provider3] ...
 
   etw_send_and_monitor.exe generate <provider_name> <event_name> [--count N] [--interval-ms N] [fields...]
 
 Examples:
+  etw_send_and_monitor.exe list
+
   etw_send_and_monitor.exe monitor "Demo.Bluetooth.Test"
 
   etw_send_and_monitor.exe monitor "{22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}"
@@ -79,6 +89,34 @@ Field format:
   Name=bool:true|false
 "#
     );
+}
+
+fn run_list() {
+    // Run the built-in Windows ETW provider listing command.
+    // This is equivalent to running:
+    //
+    //   logman query providers
+    //
+    // The output includes OS registered ETW provider names and GUIDs.
+    let output = Command::new("logman")
+        .args(["query", "providers"])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run 'logman query providers': {}", e));
+
+    if !output.stdout.is_empty() {
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    if !output.status.success() {
+        eprintln!(
+            "[error] logman query providers failed with exit code: {:?}",
+            output.status.code()
+        );
+    }
 }
 
 fn looks_like_guid(s: &str) -> bool {
@@ -99,6 +137,44 @@ fn looks_like_guid(s: &str) -> bool {
     }
 
     true
+}
+
+fn guid_to_string_from_raw_bytes(raw: &[u8; 16]) -> String {
+    // tld::Guid uses Windows in-memory layout:
+    //   data1: u32 little-endian
+    //   data2: u16 little-endian
+    //   data3: u16 little-endian
+    //   data4: [u8; 8]
+    //
+    // Standard GUID string format:
+    //   {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}
+
+    let data1 = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let data2 = u16::from_le_bytes([raw[4], raw[5]]);
+    let data3 = u16::from_le_bytes([raw[6], raw[7]]);
+
+    format!(
+        "{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
+        data1,
+        data2,
+        data3,
+        raw[8],
+        raw[9],
+        raw[10],
+        raw[11],
+        raw[12],
+        raw[13],
+        raw[14],
+        raw[15]
+    )
+}
+
+fn provider_name_to_tracelogging_guid_string(provider_name: &str) -> String {
+    // TraceLogging dynamic provider names map to stable provider GUIDs.
+    // Same provider name => same GUID.
+    let guid = tld::Guid::from_name(provider_name);
+    let raw = guid.as_bytes_raw();
+    guid_to_string_from_raw_bytes(raw)
 }
 
 fn parse_field_arg(s: &str) -> Result<DynamicField, String> {
@@ -179,22 +255,51 @@ fn on_event(record: &EventRecord, schema_locator: &SchemaLocator) {
 }
 
 fn build_provider(name_or_guid: &str) -> Provider {
-    // If input looks like a GUID, monitor by GUID.
-    // Otherwise, monitor by provider name.
-
+    // If input looks like a GUID, monitor directly by GUID.
     if looks_like_guid(name_or_guid) {
-        Provider::by_guid(name_or_guid)
+        println!("[info] monitor by GUID: {}", name_or_guid);
+
+        return Provider::by_guid(name_or_guid)
             .any(u64::MAX)
             .level(5) // Verbose
             .add_callback(on_event)
-            .build()
-    } else {
-        Provider::by_name(name_or_guid)
-            .unwrap_or_else(|e| panic!("Provider::by_name({}) failed: {:?}", name_or_guid, e))
-            .any(u64::MAX)
-            .level(5) // Verbose
-            .add_callback(on_event)
-            .build()
+            .build();
+    }
+
+    // First try provider lookup by name.
+    // This works for providers discoverable by the system.
+    match Provider::by_name(name_or_guid) {
+        Ok(builder) => {
+            println!("[info] monitor by provider name: {}", name_or_guid);
+
+            builder
+                .any(u64::MAX)
+                .level(5) // Verbose
+                .add_callback(on_event)
+                .build()
+        }
+
+        Err(err) => {
+            // Dynamic TraceLogging providers may not be discoverable by name
+            // before the generating process registers them. Fall back to
+            // TraceLogging provider-name GUID hash.
+            let fallback_guid = provider_name_to_tracelogging_guid_string(name_or_guid);
+
+            println!(
+                "[warn] Provider::by_name({}) failed: {:?}",
+                name_or_guid, err
+            );
+            println!(
+                "[info] fallback to TraceLogging name-hash GUID: {} -> {}",
+                name_or_guid, fallback_guid
+            );
+
+            Provider::by_guid(fallback_guid.as_str())
+                .any(u64::MAX)
+                .level(5) // Verbose
+                .add_callback(on_event)
+                .build()
+        }
     }
 }
 
@@ -340,12 +445,13 @@ fn run_generate(args: &[String]) {
         provider.as_ref().register();
     }
 
-    // Convert Pin<Box<tld::Provider>> to &tld::Provider.
     let provider_ref: &tld::Provider = provider.as_ref().get_ref();
 
+    let provider_guid = provider_name_to_tracelogging_guid_string(provider_name);
+
     println!(
-        "[info] provider registered: \"{}\", event=\"{}\", count={}, interval_ms={}",
-        provider_name, event_name, count, interval_ms
+        "[info] provider registered: \"{}\", guid={}, event=\"{}\", count={}, interval_ms={}",
+        provider_name, provider_guid, event_name, count, interval_ms
     );
 
     for n in 0..count {
@@ -370,6 +476,10 @@ fn main() {
     }
 
     match args[1].as_str() {
+        "list" => {
+            run_list();
+        }
+
         "monitor" => {
             run_monitor(&args[2..]);
         }
