@@ -10,46 +10,6 @@ use ferrisetw::EventRecord;
 
 use tracelogging_dynamic as tld;
 
-// ------------------------------------------------------------
-// ETW command line tool
-//
-// Subcommands:
-//
-//   list
-//     Run "logman query providers" and print all OS registered ETW providers.
-//
-//   monitor
-//     Monitor one or more ETW providers in real time.
-//
-//   generate
-//     Generate ETW events with runtime provider name,
-//     runtime event name, and runtime fields.
-//
-// Build:
-//
-//   cargo build --release
-//
-// Examples:
-//
-//   .\target\release\etw_send_and_monitor.exe list
-//
-//   .\target\release\etw_send_and_monitor.exe monitor "Demo.Bluetooth.Test"
-//
-//   .\target\release\etw_send_and_monitor.exe monitor "{22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}"
-//
-//   .\target\release\etw_send_and_monitor.exe generate "Demo.Bluetooth.Test" "ConnectEvent" "Seq=u32:1" "Status=bool:true" "Device=string:FakeBT"
-//
-//   .\target\release\etw_send_and_monitor.exe generate "Demo.Bluetooth.Test" "ConnectEvent" --count 5 --interval-ms 500 "Seq=u32:1" "Status=bool:true" "Device=string:FakeBT"
-//
-// Supported field syntax:
-//
-//   FieldName=string:value
-//   FieldName=u32:value
-//   FieldName=i64:value
-//   FieldName=bool:true
-//   FieldName=bool:false
-// ------------------------------------------------------------
-
 #[derive(Debug, Clone)]
 enum DynamicField {
     Str(String, String),
@@ -59,28 +19,25 @@ enum DynamicField {
 }
 
 fn print_usage() {
-    // Important:
-    // Use eprintln!("{}", raw_string) instead of eprintln!(raw_string).
-    // Otherwise "{guid}" inside the help text is parsed as a format placeholder.
     eprintln!(
         "{}",
         r#"Usage:
-  etw_send_and_monitor.exe list
-
-  etw_send_and_monitor.exe monitor <provider1> [provider2] [provider3] ...
-
-  etw_send_and_monitor.exe generate <provider_name> <event_name> [--count N] [--interval-ms N] [fields...]
+  winevent.exe help
+  winevent.exe logman-help
+  winevent.exe list
+  winevent.exe find <keyword>
+  winevent.exe sessions
+  winevent.exe monitor <provider1> [provider2] ...
+  winevent.exe generate <provider_name> <event_name> [--count N] [--interval-ms N] [fields...]
 
 Examples:
-  etw_send_and_monitor.exe list
-
-  etw_send_and_monitor.exe monitor "Demo.Bluetooth.Test"
-
-  etw_send_and_monitor.exe monitor "{22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}"
-
-  etw_send_and_monitor.exe generate "Demo.Bluetooth.Test" "ConnectEvent" "Seq=u32:1" "Status=bool:true" "Device=string:FakeBT"
-
-  etw_send_and_monitor.exe generate "Demo.Bluetooth.Test" "ConnectEvent" --count 5 --interval-ms 500 "Seq=u32:1" "Status=bool:true" "Device=string:FakeBT"
+  winevent.exe list
+  winevent.exe find bluetooth
+  winevent.exe sessions
+  winevent.exe monitor "Demo.Bluetooth.Test"
+  winevent.exe monitor "{22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}"
+  winevent.exe generate "Demo.Bluetooth.Test" "ConnectEvent" "Seq=u32:1" "Status=bool:true" "Device=string:FakeBT"
+  winevent.exe generate "Demo.Bluetooth.Test" "ConnectEvent" --count 5 --interval-ms 500 "Seq=u32:1" "Status=bool:true" "Device=string:FakeBT"
 
 Field format:
   Name=string:value
@@ -91,20 +48,87 @@ Field format:
     );
 }
 
+fn run_help() {
+    print_usage();
+    println!(
+        "{}",
+        r#"Extra subcommands:
+  logman-help
+      Run: logman /?
+
+  list
+      Run: logman query providers
+
+  find <keyword>
+      Run: logman query providers, then filter output by keyword
+
+  sessions
+      Run: logman query -ets
+
+Recommended workflow:
+  winevent.exe find bluetooth
+  winevent.exe monitor "{GUID}"
+  winevent.exe generate Demo.Bluetooth.Test ConnectEvent "Seq=u32:1"
+"#
+    );
+}
+
+fn run_external_command(program: &str, args: &[&str]) {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run '{} {:?}': {}", program, args, e));
+
+    if !output.stdout.is_empty() {
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    if !output.status.success() {
+        eprintln!(
+            "[error] command failed: {} {:?}, exit code: {:?}",
+            program,
+            args,
+            output.status.code()
+        );
+    }
+}
+
+fn run_logman_help() {
+    run_external_command("logman", &["/?"]);
+}
+
 fn run_list() {
-    // Run the built-in Windows ETW provider listing command.
-    // This is equivalent to running:
-    //
-    //   logman query providers
-    //
-    // The output includes OS registered ETW provider names and GUIDs.
+    run_external_command("logman", &["query", "providers"]);
+}
+
+fn run_sessions() {
+    run_external_command("logman", &["query", "-ets"]);
+}
+
+fn run_find(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("find requires a keyword");
+        print_usage();
+        std::process::exit(1);
+    }
+
+    let keyword = args[0].to_lowercase();
+
     let output = Command::new("logman")
         .args(["query", "providers"])
         .output()
         .unwrap_or_else(|e| panic!("failed to run 'logman query providers': {}", e));
 
-    if !output.stdout.is_empty() {
-        print!("{}", String::from_utf8_lossy(&output.stdout));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in stdout.lines() {
+        if line.to_lowercase().contains(&keyword) {
+            println!("{}", line);
+        }
     }
 
     if !output.stderr.is_empty() {
@@ -140,15 +164,6 @@ fn looks_like_guid(s: &str) -> bool {
 }
 
 fn guid_to_string_from_raw_bytes(raw: &[u8; 16]) -> String {
-    // tld::Guid uses Windows in-memory layout:
-    //   data1: u32 little-endian
-    //   data2: u16 little-endian
-    //   data3: u16 little-endian
-    //   data4: [u8; 8]
-    //
-    // Standard GUID string format:
-    //   {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}
-
     let data1 = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
     let data2 = u16::from_le_bytes([raw[4], raw[5]]);
     let data3 = u16::from_le_bytes([raw[6], raw[7]]);
@@ -170,24 +185,12 @@ fn guid_to_string_from_raw_bytes(raw: &[u8; 16]) -> String {
 }
 
 fn provider_name_to_tracelogging_guid_string(provider_name: &str) -> String {
-    // TraceLogging dynamic provider names map to stable provider GUIDs.
-    // Same provider name => same GUID.
     let guid = tld::Guid::from_name(provider_name);
     let raw = guid.as_bytes_raw();
     guid_to_string_from_raw_bytes(raw)
 }
 
 fn parse_field_arg(s: &str) -> Result<DynamicField, String> {
-    // Expected format:
-    //
-    //   Name=type:value
-    //
-    // Example:
-    //
-    //   Seq=u32:1
-    //   Device=string:FakeBT
-    //   Status=bool:true
-
     let (name, rhs) = s
         .split_once('=')
         .ok_or_else(|| format!("Invalid field '{}': missing '='", s))?;
@@ -203,7 +206,6 @@ fn parse_field_arg(s: &str) -> Result<DynamicField, String> {
             let parsed = value
                 .parse::<u32>()
                 .map_err(|e| format!("Invalid u32 in '{}': {}", s, e))?;
-
             Ok(DynamicField::U32(name.to_string(), parsed))
         }
 
@@ -211,7 +213,6 @@ fn parse_field_arg(s: &str) -> Result<DynamicField, String> {
             let parsed = value
                 .parse::<i64>()
                 .map_err(|e| format!("Invalid i64 in '{}': {}", s, e))?;
-
             Ok(DynamicField::I64(name.to_string(), parsed))
         }
 
@@ -219,7 +220,6 @@ fn parse_field_arg(s: &str) -> Result<DynamicField, String> {
             let parsed = value
                 .parse::<bool>()
                 .map_err(|e| format!("Invalid bool in '{}': {}", s, e))?;
-
             Ok(DynamicField::Bool(name.to_string(), parsed))
         }
 
@@ -231,10 +231,6 @@ fn parse_field_arg(s: &str) -> Result<DynamicField, String> {
 }
 
 fn on_event(record: &EventRecord, schema_locator: &SchemaLocator) {
-    // This monitor is generic.
-    // It does not assume a known event payload schema.
-    // It prints provider name and event id only.
-
     match schema_locator.event_schema(record) {
         Ok(schema) => {
             println!(
@@ -255,34 +251,28 @@ fn on_event(record: &EventRecord, schema_locator: &SchemaLocator) {
 }
 
 fn build_provider(name_or_guid: &str) -> Provider {
-    // If input looks like a GUID, monitor directly by GUID.
     if looks_like_guid(name_or_guid) {
         println!("[info] monitor by GUID: {}", name_or_guid);
 
         return Provider::by_guid(name_or_guid)
             .any(u64::MAX)
-            .level(5) // Verbose
+            .level(5)
             .add_callback(on_event)
             .build();
     }
 
-    // First try provider lookup by name.
-    // This works for providers discoverable by the system.
     match Provider::by_name(name_or_guid) {
         Ok(builder) => {
             println!("[info] monitor by provider name: {}", name_or_guid);
 
             builder
                 .any(u64::MAX)
-                .level(5) // Verbose
+                .level(5)
                 .add_callback(on_event)
                 .build()
         }
 
         Err(err) => {
-            // Dynamic TraceLogging providers may not be discoverable by name
-            // before the generating process registers them. Fall back to
-            // TraceLogging provider-name GUID hash.
             let fallback_guid = provider_name_to_tracelogging_guid_string(name_or_guid);
 
             println!(
@@ -296,7 +286,7 @@ fn build_provider(name_or_guid: &str) -> Provider {
 
             Provider::by_guid(fallback_guid.as_str())
                 .any(u64::MAX)
-                .level(5) // Verbose
+                .level(5)
                 .add_callback(on_event)
                 .build()
         }
@@ -335,15 +325,12 @@ fn write_one_event(provider: &tld::Provider, event_name: &str, fields: &[Dynamic
     let level = tld::Level::Verbose;
     let keyword: u64 = 0x1;
 
-    // If nobody is listening, EventBuilder work is skipped.
     if !provider.enabled(level, keyword) {
         println!("[send] nobody is listening for this level/keyword; event skipped");
         return;
     }
 
     let mut builder = tld::EventBuilder::new();
-
-    // Start a new dynamic event.
     builder.reset(event_name, level, keyword, 0);
 
     for field in fields {
@@ -361,15 +348,12 @@ fn write_one_event(provider: &tld::Provider, event_name: &str, fields: &[Dynamic
             }
 
             DynamicField::Bool(name, value) => {
-                // add_bool32 expects i32, not bool.
-                // ETW Bool32 convention: 0 = false, non-zero = true.
                 let bool32_value: i32 = if *value { 1 } else { 0 };
                 builder.add_bool32(name, bool32_value, tld::OutType::Default, 0);
             }
         }
     }
 
-    // EventBuilder::write expects &tld::Provider.
     let status = builder.write(provider, None, None);
 
     if status != 0 {
@@ -439,8 +423,6 @@ fn run_generate(args: &[String]) {
         &tld::Provider::options(),
     ));
 
-    // register() is unsafe because a registered provider must be properly unregistered.
-    // For this short-lived CLI tool, provider cleanup happens when it is dropped.
     unsafe {
         provider.as_ref().register();
     }
@@ -476,8 +458,24 @@ fn main() {
     }
 
     match args[1].as_str() {
+        "help" | "-h" | "--help" | "/?" => {
+            run_help();
+        }
+
+        "logman-help" => {
+            run_logman_help();
+        }
+
         "list" => {
             run_list();
+        }
+
+        "find" => {
+            run_find(&args[2..]);
+        }
+
+        "sessions" => {
+            run_sessions();
         }
 
         "monitor" => {
