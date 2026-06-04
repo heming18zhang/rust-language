@@ -1,0 +1,8 @@
+[package]
+name = "etw_send_and_monitor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ferrisetw = "1.2"
+tracelogging = "1.2"
