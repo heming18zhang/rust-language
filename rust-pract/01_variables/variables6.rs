@@ -1,5 +1,5 @@
 // TODO: Change the line below to fix the compiler error.
-const NUMBER: i32 = 3;
+const NUMBER: u8 = 8;
 
 fn main() {
     println!("Number: {NUMBER}");
