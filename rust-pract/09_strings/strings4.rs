@@ -1,7 +1,5 @@
 // Calls of this function should be replaced with calls of `string_slice` or `string`.
-fn placeholder() {
-
-}
+fn placeholder() {}
 
 fn string_slice(arg: &str) {
     println!("{arg}");
@@ -23,7 +21,7 @@ fn main() {
 
     string("rust is fun!".to_owned());
 
-    string("nice weather".into());
+    string_slice("nice weather".into());
 
     string(format!("Interpolation {}", "Station"));
 

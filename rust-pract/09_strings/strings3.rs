@@ -5,12 +5,16 @@ fn trim_me(input: &str) -> &str {
 
 fn compose_me(input: &str) -> String {
     // TODO: Add " world!" to the string! There are multiple ways to do this.
-    format!("{} world!", input)
+    let mut rets = input.to_string();
+    rets.push_str(" world!");
+    rets
 }
 
 fn replace_me(input: &str) -> String {
     // TODO: Replace "cars" in the string with "balloons".
-    input.replace("cars", "balloons")
+    let  rets = input.to_string();
+    let returns = rets.replace("cars", "balloons");
+    returns
 }
 
 fn main() {

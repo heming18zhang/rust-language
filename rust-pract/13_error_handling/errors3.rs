@@ -2,6 +2,7 @@
 // `total_cost` function from the previous exercise. It's not working though!
 // Why not? What should we do to fix it?
 
+use std::error::Error;
 use std::num::ParseIntError;
 
 // Don't change this function.
@@ -15,12 +16,12 @@ fn total_cost(item_quantity: &str) -> Result<i32, ParseIntError> {
 
 // TODO: Fix the compiler error by changing the signature and body of the
 // `main` function.
-fn main() {
+fn main()-> Result<(), Box<dyn Error>> {
     let mut tokens = 100;
     let pretend_user_input = "8";
 
     // Don't change this line.
-    let cost = total_cost(pretend_user_input).unwrap();
+    let cost = total_cost(pretend_user_input)?;
 
     if cost > tokens {
         println!("You can't afford that many!");
@@ -28,4 +29,5 @@ fn main() {
         tokens -= cost;
         println!("You now have {tokens} tokens.");
     }
+    Ok(())
 }

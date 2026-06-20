@@ -5,20 +5,21 @@
 
 // Shouldn't take ownership
 fn get_char(data: &String) -> char {
+    //let data = data.clone();
     data.chars().last().unwrap()
 }
 
 // Should take ownership
-fn string_uppercase(mut data: String) {
-    data = data.to_uppercase();
+fn string_uppercase(data: &mut String) {
+     let ud = data.to_uppercase();
 
     println!("{data}");
 }
 
 fn main() {
-    let data = "Rust is great!".to_string();
+    let mut data = "Rust is great!".to_string();
 
     get_char(&data);
 
-    string_uppercase(data);
+    string_uppercase(&mut data);
 }
